@@ -3,7 +3,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
 import yaml
@@ -25,11 +25,27 @@ def normalize_text(text: str) -> str:
     return text
 
 
+def parse_chat_ids(value: str, env_name: str) -> List[int]:
+    chat_ids: List[int] = []
+
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            chat_ids.append(int(raw))
+        except ValueError as e:
+            raise RuntimeError(
+                f"{env_name} must contain integers separated by commas"
+            ) from e
+
+    if not chat_ids:
+        raise RuntimeError(f"{env_name} environment variable is empty")
+
+    return list(dict.fromkeys(chat_ids))
+
+
 def escape_markdown(text: str) -> str:
-    """
-    Экранирует спецсимволы markdown, чтобы текст пользователя
-    не ломал форматирование служебного сообщения.
-    """
     if not text:
         return ""
     return re.sub(r'([\\`*_\[\]()~>#+\-=|{}.!])', r'\\\1', text)
@@ -50,11 +66,20 @@ def build_max_user_markdown(user_id: int, user_name: str) -> str:
 
 
 class Intent:
-    def __init__(self, name: str, triggers: List[str], response: str, priority: float = 0) -> None:
+    def __init__(
+        self,
+        name: str,
+        triggers: List[str],
+        response: str,
+        priority: float = 0,
+    ) -> None:
         self.name = name
         self.response = response
         self.priority = priority
-        self.patterns = [re.compile(pattern, re.IGNORECASE | re.UNICODE) for pattern in triggers]
+        self.patterns = [
+            re.compile(pattern, re.IGNORECASE | re.UNICODE)
+            for pattern in triggers
+        ]
 
     def match(self, text: str) -> bool:
         return any(pattern.search(text) for pattern in self.patterns)
@@ -76,6 +101,10 @@ def load_intents(path: str) -> Dict[str, "Intent"]:
         triggers = item.get("triggers", [])
         response = item.get("response", "")
         priority = item.get("priority", 0)
+
+        if not name:
+            continue
+
         intents[name] = Intent(
             name=name,
             triggers=triggers,
@@ -93,8 +122,15 @@ class MaxBotAPI:
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self):
+        timeout = aiohttp.ClientTimeout(
+            total=70,
+            connect=10,
+            sock_connect=10,
+            sock_read=40,
+        )
         self.session = aiohttp.ClientSession(
-            headers={"Authorization": self.token}
+            headers={"Authorization": self.token},
+            timeout=timeout,
         )
         return self
 
@@ -110,6 +146,7 @@ class MaxBotAPI:
 
     async def get_updates(self, marker: Optional[int] = None) -> dict:
         assert self.session is not None
+
         params = {
             "timeout": 30,
             "limit": 100,
@@ -159,13 +196,19 @@ class AdmissionsBot:
         api: MaxBotAPI,
         intents: Dict[str, "Intent"],
         fallback_intent: "Intent",
-        staff_chat_id: int,
+        staff_chat_ids: List[int],
+        bot_user_id: Optional[int] = None,
     ) -> None:
         self.api = api
         self.intents = intents
         self.fallback_intent = fallback_intent
-        self.staff_chat_id = staff_chat_id
+        self.staff_chat_ids = staff_chat_ids
+        self.staff_chat_ids_set: Set[int] = set(staff_chat_ids)
+        self.bot_user_id = bot_user_id
         self.escalation_queue: asyncio.Queue = asyncio.Queue()
+
+    def is_staff_chat(self, chat_id: Optional[int]) -> bool:
+        return chat_id in self.staff_chat_ids_set if chat_id is not None else False
 
     async def handle_update(self, update: Dict[str, Any]) -> None:
         update_type = update.get("update_type")
@@ -175,7 +218,8 @@ class AdmissionsBot:
             chat_id = update.get("chat_id")
             if chat_id:
                 await self.api.send_message(
-                    "Здравствуйте! Я виртуальный помощник приёмной комиссии ЮЗГУ. Напишите ваш вопрос.",
+                    "Здравствуйте! Я виртуальный помощник приёмной комиссии ЮЗГУ. "
+                    "Напишите ваш вопрос.",
                     chat_id=chat_id,
                 )
             return
@@ -199,6 +243,19 @@ class AdmissionsBot:
         first_name = sender.get("first_name") or ""
         last_name = sender.get("last_name") or ""
         username = sender.get("username")
+        is_bot = bool(sender.get("is_bot"))
+
+        if is_bot:
+            logger.info("Ignoring bot message from sender=%s", user_id)
+            return
+
+        if self.bot_user_id is not None and user_id == self.bot_user_id:
+            logger.info("Ignoring self message from bot_user_id=%s", user_id)
+            return
+
+        if self.is_staff_chat(chat_id):
+            logger.info("Ignoring message from staff chat_id=%s", chat_id)
+            return
 
         full_name = f"{first_name} {last_name}".strip()
         if not full_name:
@@ -210,7 +267,8 @@ class AdmissionsBot:
 
         if text_normalized == "/start":
             await self.api.send_message(
-                "Здравствуйте! Я виртуальный помощник приёмной комиссии ЮЗГУ. Напишите ваш вопрос.",
+                "Здравствуйте! Я виртуальный помощник приёмной комиссии ЮЗГУ. "
+                "Напишите ваш вопрос.",
                 chat_id=chat_id,
             )
             return
@@ -247,7 +305,8 @@ class AdmissionsBot:
         text: str,
     ) -> None:
         await self.api.send_message(
-            "Ваш вопрос передан специалисту приёмной комиссии. Пожалуйста, ожидайте ответа.",
+            "Ваш вопрос передан специалисту приёмной комиссии. "
+            "Пожалуйста, ожидайте ответа.",
             chat_id=chat_id,
         )
 
@@ -288,14 +347,24 @@ class AdmissionsBot:
                     f"Сообщение: {escape_markdown(text)}"
                 )
 
-                await self.api.send_message(
-                    staff_notification,
-                    chat_id=self.staff_chat_id,
-                    format="markdown",
-                )
-                logger.info("Escalation sent to staff")
+                for staff_chat_id in self.staff_chat_ids:
+                    try:
+                        await self.api.send_message(
+                            staff_notification,
+                            chat_id=staff_chat_id,
+                            format="markdown",
+                        )
+                        logger.info(
+                            "Escalation sent to staff chat_id=%s",
+                            staff_chat_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Ошибка отправки сотруднику chat_id=%s",
+                            staff_chat_id,
+                        )
             except Exception:
-                logger.exception("Ошибка отправки сотрудникам")
+                logger.exception("Ошибка подготовки эскалации сотрудникам")
             finally:
                 self.escalation_queue.task_done()
 
@@ -312,9 +381,13 @@ class AdmissionsBot:
                 for update in updates:
                     try:
                         await self.handle_update(update)
+                    except asyncio.CancelledError:
+                        raise
                     except Exception:
                         logger.exception("Ошибка обработки update: %s", update)
 
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("Ошибка long polling")
                 await asyncio.sleep(2)
@@ -332,7 +405,7 @@ async def main() -> None:
     staff_chat_id_env = os.environ.get("STAFF_CHAT_ID_MAX")
     if not staff_chat_id_env:
         raise RuntimeError("STAFF_CHAT_ID_MAX environment variable not set")
-    staff_chat_id = int(staff_chat_id_env)
+    staff_chat_ids = parse_chat_ids(staff_chat_id_env, "STAFF_CHAT_ID_MAX")
 
     intents = load_intents(scenarios_file)
     fallback_intent = intents.get("fallback")
@@ -341,13 +414,19 @@ async def main() -> None:
 
     async with MaxBotAPI(token) as api:
         me = await api.get_me()
-        logger.info("Авторизация успешна: bot_id=%s username=%s", me.get("user_id"), me.get("username"))
+        bot_user_id = me.get("user_id")
+        logger.info(
+            "Авторизация успешна: bot_id=%s username=%s",
+            bot_user_id,
+            me.get("username"),
+        )
 
         bot = AdmissionsBot(
             api=api,
             intents=intents,
             fallback_intent=fallback_intent,
-            staff_chat_id=staff_chat_id,
+            staff_chat_ids=staff_chat_ids,
+            bot_user_id=bot_user_id,
         )
 
         worker_task = asyncio.create_task(bot.escalation_worker())
@@ -356,8 +435,9 @@ async def main() -> None:
         try:
             await asyncio.gather(worker_task, polling_task)
         finally:
-            worker_task.cancel()
-            polling_task.cancel()
+            for task in (worker_task, polling_task):
+                task.cancel()
+            await asyncio.gather(worker_task, polling_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

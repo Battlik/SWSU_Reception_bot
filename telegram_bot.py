@@ -5,7 +5,7 @@ import re
 from contextlib import suppress
 from html import escape
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from dotenv import load_dotenv
 import yaml
@@ -36,6 +36,26 @@ def normalize_text(text: str) -> str:
     return text
 
 
+def parse_chat_ids(value: str, env_name: str) -> List[int]:
+    chat_ids: List[int] = []
+
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            chat_ids.append(int(raw))
+        except ValueError as e:
+            raise RuntimeError(
+                f"{env_name} must contain integers separated by commas"
+            ) from e
+
+    if not chat_ids:
+        raise RuntimeError(f"{env_name} environment variable is empty")
+
+    return list(dict.fromkeys(chat_ids))
+
+
 def build_public_user_link(username: Optional[str]) -> Optional[str]:
     if not username:
         return None
@@ -55,7 +75,10 @@ class Intent:
     def __init__(self, name: str, triggers: List[str], response: str) -> None:
         self.name = name
         self.response = response
-        self.patterns = [re.compile(pattern, re.IGNORECASE | re.UNICODE) for pattern in triggers]
+        self.patterns = [
+            re.compile(pattern, re.IGNORECASE | re.UNICODE)
+            for pattern in triggers
+        ]
 
     def match(self, text: str) -> bool:
         return any(pattern.search(text) for pattern in self.patterns)
@@ -81,14 +104,18 @@ class AdmissionsBot:
         self,
         intents: Dict[str, "Intent"],
         fallback_intent: "Intent",
-        staff_chat_id: int,
+        staff_chat_ids: List[int],
         group_chat_id: Optional[int] = None,
     ) -> None:
         self.intents = intents
         self.fallback_intent = fallback_intent
-        self.staff_chat_id = staff_chat_id
+        self.staff_chat_ids = staff_chat_ids
+        self.staff_chat_ids_set: Set[int] = set(staff_chat_ids)
         self.group_chat_id = group_chat_id
         self.escalation_queue: asyncio.Queue = asyncio.Queue()
+
+    def is_staff_chat(self, chat_id: int) -> bool:
+        return chat_id in self.staff_chat_ids_set
 
     async def handle_message(
         self,
@@ -98,7 +125,18 @@ class AdmissionsBot:
         if update.message is None or update.message.text is None:
             return
 
-        message_text = update.message.text.strip()
+        message = update.message
+        user = update.effective_user
+        chat = message.chat
+
+        if user and user.is_bot:
+            return
+
+        if self.is_staff_chat(chat.id):
+            logger.info("Ignoring message from staff chat_id=%s", chat.id)
+            return
+
+        message_text = message.text.strip()
         if not message_text:
             return
 
@@ -117,7 +155,7 @@ class AdmissionsBot:
 
         if matched_intent:
             logger.info("Matched intent %s: %s", matched_intent.name, message_text)
-            await update.message.reply_text(matched_intent.response)
+            await message.reply_text(matched_intent.response)
             return
 
         await self.handle_complex_question(update, context)
@@ -191,12 +229,17 @@ class AdmissionsBot:
                         f"{escape(public_link)}</a>"
                     )
                 else:
-                    public_link_line = "Публичная ссылка: недоступна (у пользователя нет username)"
+                    public_link_line = (
+                        "Публичная ссылка: недоступна "
+                        "(у пользователя нет username)"
+                    )
 
                 if chat_type == "private":
                     chat_line = f"Чат: private (<code>{chat_id}</code>)"
                 else:
-                    chat_line = f"Чат: {escape(str(chat_title))} (<code>{chat_id}</code>)"
+                    chat_line = (
+                        f"Чат: {escape(str(chat_title))} (<code>{chat_id}</code>)"
+                    )
 
                 staff_notification = (
                     f"⚠️ <b>Сложный вопрос</b>\n"
@@ -208,16 +251,27 @@ class AdmissionsBot:
                     f"Сообщение: {escape(text)}"
                 )
 
-                await application.bot.send_message(
-                    chat_id=self.staff_chat_id,
-                    text=staff_notification,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-                logger.info("Escalation sent to staff for user_id=%s", user_id)
+                for staff_chat_id in self.staff_chat_ids:
+                    try:
+                        await application.bot.send_message(
+                            chat_id=staff_chat_id,
+                            text=staff_notification,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                        logger.info(
+                            "Escalation sent to staff chat_id=%s for user_id=%s",
+                            staff_chat_id,
+                            user_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Ошибка отправки сотруднику chat_id=%s",
+                            staff_chat_id,
+                        )
 
             except Exception as e:
-                logger.exception("Ошибка отправки сотрудникам: %s", e)
+                logger.exception("Ошибка подготовки эскалации сотрудникам: %s", e)
             finally:
                 self.escalation_queue.task_done()
 
@@ -234,7 +288,7 @@ async def main() -> None:
     staff_chat_id_env = os.environ.get("STAFF_CHAT_ID")
     if not staff_chat_id_env:
         raise RuntimeError("STAFF_CHAT_ID environment variable not set")
-    staff_chat_id = int(staff_chat_id_env)
+    staff_chat_ids = parse_chat_ids(staff_chat_id_env, "STAFF_CHAT_ID")
 
     group_chat_id_env = os.environ.get("GROUP_CHAT_ID")
     group_chat_id = int(group_chat_id_env) if group_chat_id_env else None
@@ -247,15 +301,11 @@ async def main() -> None:
     admissions_bot = AdmissionsBot(
         intents=intents,
         fallback_intent=fallback_intent,
-        staff_chat_id=staff_chat_id,
+        staff_chat_ids=staff_chat_ids,
         group_chat_id=group_chat_id,
     )
 
-    application = (
-        ApplicationBuilder()
-        .token(token)
-        .build()
-    )
+    application = ApplicationBuilder().token(token).build()
 
     application.bot_data["admissions_bot"] = admissions_bot
     application.add_handler(
@@ -270,7 +320,7 @@ async def main() -> None:
     await application.start()
 
     worker_task = asyncio.create_task(admissions_bot.escalation_worker(application))
-    logger.info("Escalation worker started")
+    logger.info("Escalation worker task created")
 
     await application.updater.start_polling()
 
