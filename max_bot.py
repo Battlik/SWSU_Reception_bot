@@ -1,7 +1,9 @@
 import asyncio
+import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -25,24 +27,24 @@ def normalize_text(text: str) -> str:
     return text
 
 
-def parse_chat_ids(value: str, env_name: str) -> List[int]:
-    chat_ids: List[int] = []
+def parse_int_list(value: str, env_name: str) -> List[int]:
+    result: List[int] = []
 
     for raw in value.split(","):
         raw = raw.strip()
         if not raw:
             continue
         try:
-            chat_ids.append(int(raw))
+            result.append(int(raw))
         except ValueError as e:
             raise RuntimeError(
                 f"{env_name} must contain integers separated by commas"
             ) from e
 
-    if not chat_ids:
+    if not result:
         raise RuntimeError(f"{env_name} environment variable is empty")
 
-    return list(dict.fromkeys(chat_ids))
+    return list(dict.fromkeys(result))
 
 
 def escape_markdown(text: str) -> str:
@@ -86,8 +88,12 @@ class Intent:
 
 
 def load_intents(path: str) -> Dict[str, "Intent"]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+    scenarios_path = Path(path)
+    if not scenarios_path.exists():
+        raise RuntimeError(f"Scenarios file not found: {path}")
+
+    with scenarios_path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
 
     items = sorted(
         data.get("intents", []),
@@ -105,13 +111,176 @@ def load_intents(path: str) -> Dict[str, "Intent"]:
         if not name:
             continue
 
+        if not isinstance(triggers, list):
+            raise RuntimeError(f"Intent '{name}' must contain a list in 'triggers'")
+
         intents[name] = Intent(
             name=name,
             triggers=triggers,
             response=response,
             priority=priority,
         )
+
+    if "fallback" not in intents:
+        intents["fallback"] = Intent(
+            name="fallback",
+            triggers=[],
+            response="",
+            priority=-1,
+        )
+
     return intents
+
+
+class JsonStateFile:
+    def __init__(self, path: str, default_data: Dict[str, Any]) -> None:
+        self.path = Path(path)
+        self.default_data = default_data
+
+    def load(self) -> Dict[str, Any]:
+        if not self.path.exists():
+            return dict(self.default_data)
+
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return dict(self.default_data)
+            return raw
+        except Exception:
+            logger.exception("Failed to load state from %s", self.path)
+            return dict(self.default_data)
+
+    def save(self, data: Dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self.path)
+
+
+class IgnoreStore:
+    """
+    Хранит user_id -> unix_timestamp_until
+    и сохраняет состояние в JSON-файл.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        self._data: Dict[str, float] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            self._data = {}
+            return
+
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("Failed to load ignore store from %s", self.path)
+            self._data = {}
+            return
+
+        if not isinstance(raw, dict):
+            logger.warning("Ignore store %s is not a dict, resetting", self.path)
+            self._data = {}
+            return
+
+        now = time.time()
+        cleaned: Dict[str, float] = {}
+
+        for key, value in raw.items():
+            try:
+                user_id = str(int(key))
+                until_ts = float(value)
+            except (TypeError, ValueError):
+                continue
+
+            if until_ts > now:
+                cleaned[user_id] = until_ts
+
+        self._data = cleaned
+        self._save()
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(self._data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self.path)
+
+    def is_ignored(self, user_id: int) -> bool:
+        key = str(user_id)
+        until_ts = self._data.get(key)
+        if until_ts is None:
+            return False
+
+        if until_ts <= time.time():
+            self._data.pop(key, None)
+            self._save()
+            return False
+
+        return True
+
+    def remaining_seconds(self, user_id: int) -> int:
+        key = str(user_id)
+        until_ts = self._data.get(key)
+        if until_ts is None:
+            return 0
+
+        remaining = int(until_ts - time.time())
+        if remaining <= 0:
+            self._data.pop(key, None)
+            self._save()
+            return 0
+
+        return remaining
+
+    def set_ignore(self, user_id: int, ttl_seconds: int) -> None:
+        ttl_seconds = max(1, int(ttl_seconds))
+        self._data[str(user_id)] = time.time() + ttl_seconds
+        self._save()
+
+    def prune_expired(self) -> int:
+        now = time.time()
+        before = len(self._data)
+
+        self._data = {
+            key: until_ts
+            for key, until_ts in self._data.items()
+            if until_ts > now
+        }
+
+        removed = before - len(self._data)
+        if removed > 0:
+            self._save()
+
+        return removed
+
+    def count(self) -> int:
+        return len(self._data)
+
+
+class BotControlState:
+    def __init__(self, path: str) -> None:
+        self.storage = JsonStateFile(path, default_data={"paused": False})
+        self.paused = False
+        self._load()
+
+    def _load(self) -> None:
+        data = self.storage.load()
+        self.paused = bool(data.get("paused", False))
+
+    def save(self) -> None:
+        self.storage.save({"paused": self.paused})
+
+    def set_paused(self, value: bool) -> None:
+        self.paused = bool(value)
+        self.save()
 
 
 class MaxBotAPI:
@@ -147,7 +316,7 @@ class MaxBotAPI:
     async def get_updates(self, marker: Optional[int] = None) -> dict:
         assert self.session is not None
 
-        params = {
+        params: Dict[str, Any] = {
             "timeout": 30,
             "limit": 100,
         }
@@ -168,13 +337,13 @@ class MaxBotAPI:
     ) -> dict:
         assert self.session is not None
 
-        params = {}
+        params: Dict[str, Any] = {}
         if user_id is not None:
             params["user_id"] = user_id
         if chat_id is not None:
             params["chat_id"] = chat_id
 
-        payload = {
+        payload: Dict[str, Any] = {
             "text": text,
             "notify": True,
         }
@@ -194,34 +363,123 @@ class AdmissionsBot:
     def __init__(
         self,
         api: MaxBotAPI,
-        intents: Dict[str, "Intent"],
-        fallback_intent: "Intent",
+        intents: Dict[str, Intent],
+        fallback_intent: Intent,
         staff_chat_ids: List[int],
-        bot_user_id: Optional[int] = None,
+        staff_user_ids: List[int],
+        bot_user_id: Optional[int],
+        ignore_ttl_seconds: int,
+        ignore_state_file: str,
+        bot_state_file: str,
+        cleanup_interval_seconds: int,
     ) -> None:
         self.api = api
         self.intents = intents
         self.fallback_intent = fallback_intent
+
         self.staff_chat_ids = staff_chat_ids
         self.staff_chat_ids_set: Set[int] = set(staff_chat_ids)
+
+        self.staff_user_ids = staff_user_ids
+        self.staff_user_ids_set: Set[int] = set(staff_user_ids)
+
         self.bot_user_id = bot_user_id
-        self.escalation_queue: asyncio.Queue = asyncio.Queue()
+
+        self.ignore_ttl_seconds = int(ignore_ttl_seconds)
+        self.cleanup_interval_seconds = max(60, int(cleanup_interval_seconds))
+
+        self.ignore_store = IgnoreStore(ignore_state_file)
+        self.control_state = BotControlState(bot_state_file)
+
+        self.escalation_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
 
     def is_staff_chat(self, chat_id: Optional[int]) -> bool:
         return chat_id in self.staff_chat_ids_set if chat_id is not None else False
 
+    def is_staff_user(self, user_id: Optional[int]) -> bool:
+        return user_id in self.staff_user_ids_set if user_id is not None else False
+
+    def is_paused(self) -> bool:
+        return self.control_state.paused
+
+    def set_paused(self, value: bool) -> None:
+        self.control_state.set_paused(value)
+
+    async def send_user_start(self, chat_id: int) -> None:
+        if self.is_paused():
+            await self.api.send_message(
+                "Бот временно находится на паузе. Попробуйте написать позже.",
+                chat_id=chat_id,
+            )
+            return
+
+        await self.api.send_message(
+            "Здравствуйте! Я виртуальный помощник приёмной комиссии ЮЗГУ. "
+            "Напишите ваш вопрос. Если вопрос сложный, я передам его специалисту.",
+            chat_id=chat_id,
+        )
+
+    async def handle_admin_command(
+        self,
+        text_normalized: str,
+        chat_id: int,
+        user_id: int,
+    ) -> bool:
+        if not self.is_staff_user(user_id):
+            return False
+
+        if text_normalized == "/pause":
+            if self.is_paused():
+                await self.api.send_message(
+                    "Бот уже находится на паузе.",
+                    chat_id=chat_id,
+                )
+            else:
+                self.set_paused(True)
+                await self.api.send_message(
+                    "Бот переведён в режим паузы.\n"
+                    "Обычные пользователи сейчас полностью игнорируются.",
+                    chat_id=chat_id,
+                )
+                logger.warning("Bot paused by staff user_id=%s", user_id)
+            return True
+
+        if text_normalized == "/resume":
+            if not self.is_paused():
+                await self.api.send_message(
+                    "Бот уже активен.",
+                    chat_id=chat_id,
+                )
+            else:
+                self.set_paused(False)
+                await self.api.send_message(
+                    "Бот снова активен.\n"
+                    "Обработка сообщений возобновлена.",
+                    chat_id=chat_id,
+                )
+                logger.warning("Bot resumed by staff user_id=%s", user_id)
+            return True
+
+        if text_normalized == "/status":
+            status_text = "на паузе" if self.is_paused() else "активен"
+            await self.api.send_message(
+                f"Статус бота: {status_text}\n"
+                f"Пользователей в игноре: {self.ignore_store.count()}\n"
+                f"Интервал очистки: {self.cleanup_interval_seconds} сек.",
+                chat_id=chat_id,
+            )
+            return True
+
+        return False
+
     async def handle_update(self, update: Dict[str, Any]) -> None:
         update_type = update.get("update_type")
-        logger.info("update_type=%s update=%s", update_type, update)
+        logger.info("update_type=%s", update_type)
 
         if update_type == "bot_started":
             chat_id = update.get("chat_id")
             if chat_id:
-                await self.api.send_message(
-                    "Здравствуйте! Я виртуальный помощник приёмной комиссии ЮЗГУ. "
-                    "Напишите ваш вопрос.",
-                    chat_id=chat_id,
-                )
+                await self.send_user_start(chat_id)
             return
 
         if update_type != "message_created":
@@ -245,6 +503,14 @@ class AdmissionsBot:
         username = sender.get("username")
         is_bot = bool(sender.get("is_bot"))
 
+        if not chat_id:
+            logger.warning("Не найден chat_id в update: %s", update)
+            return
+
+        if user_id is None:
+            logger.warning("Не найден user_id в update: %s", update)
+            return
+
         if is_bot:
             logger.info("Ignoring bot message from sender=%s", user_id)
             return
@@ -253,25 +519,59 @@ class AdmissionsBot:
             logger.info("Ignoring self message from bot_user_id=%s", user_id)
             return
 
+        # Админские команды сотрудника обрабатываем ДО общего игнора staff
+        if await self.handle_admin_command(text_normalized, chat_id, user_id):
+            return
+
+        # Обычный /start для пользователей
+        if text_normalized == "/start":
+            if self.is_staff_user(user_id):
+                await self.api.send_message(
+                    "Для управления ботом используйте:\n"
+                    "/pause — поставить бота на паузу\n"
+                    "/resume — снять паузу\n"
+                    "/status — проверить статус",
+                    chat_id=chat_id,
+                )
+            else:
+                await self.send_user_start(chat_id)
+            return
+
+        # Полный игнор сотрудников на обычные сообщения
+        if self.is_staff_user(user_id):
+            logger.info(
+                "Ignoring regular message from staff user_id=%s in chat_id=%s",
+                user_id,
+                chat_id,
+            )
+            return
+
+        # Игнор служебных чатов
         if self.is_staff_chat(chat_id):
             logger.info("Ignoring message from staff chat_id=%s", chat_id)
+            return
+
+        # Пауза бота
+        if self.is_paused():
+            logger.info(
+                "Ignoring message because bot is paused: user_id=%s chat_id=%s",
+                user_id,
+                chat_id,
+            )
+            return
+
+        # Cooldown пользователя
+        if self.ignore_store.is_ignored(user_id):
+            logger.info(
+                "Ignoring message from user_id=%s due to active cooldown (%s sec left)",
+                user_id,
+                self.ignore_store.remaining_seconds(user_id),
+            )
             return
 
         full_name = f"{first_name} {last_name}".strip()
         if not full_name:
             full_name = username or f"Пользователь {user_id}"
-
-        if not chat_id:
-            logger.warning("Не найден chat_id в update: %s", update)
-            return
-
-        if text_normalized == "/start":
-            await self.api.send_message(
-                "Здравствуйте! Я виртуальный помощник приёмной комиссии ЮЗГУ. "
-                "Напишите ваш вопрос.",
-                chat_id=chat_id,
-            )
-            return
 
         matched_intent: Optional[Intent] = None
         for name, intent in self.intents.items():
@@ -291,7 +591,7 @@ class AdmissionsBot:
 
         await self.handle_complex_question(
             chat_id=chat_id,
-            user_id=user_id or 0,
+            user_id=user_id,
             user_name=full_name,
             text=text,
         )
@@ -310,6 +610,8 @@ class AdmissionsBot:
             chat_id=chat_id,
         )
 
+        self.ignore_store.set_ignore(user_id, self.ignore_ttl_seconds)
+
         await self.escalation_queue.put(
             {
                 "user_id": user_id,
@@ -317,6 +619,13 @@ class AdmissionsBot:
                 "chat_id": chat_id,
                 "text": text,
             }
+        )
+
+        logger.info(
+            "Escalated user_id=%s chat_id=%s and set cooldown for %s seconds",
+            user_id,
+            chat_id,
+            self.ignore_ttl_seconds,
         )
 
     async def escalation_worker(self) -> None:
@@ -355,18 +664,42 @@ class AdmissionsBot:
                             format="markdown",
                         )
                         logger.info(
-                            "Escalation sent to staff chat_id=%s",
+                            "Escalation sent to staff chat_id=%s for user_id=%s",
                             staff_chat_id,
+                            user_id,
                         )
                     except Exception:
                         logger.exception(
                             "Ошибка отправки сотруднику chat_id=%s",
                             staff_chat_id,
                         )
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("Ошибка подготовки эскалации сотрудникам")
             finally:
                 self.escalation_queue.task_done()
+
+    async def cleanup_worker(self) -> None:
+        logger.info(
+            "Cleanup worker started, interval=%s sec",
+            self.cleanup_interval_seconds,
+        )
+
+        while True:
+            try:
+                await asyncio.sleep(self.cleanup_interval_seconds)
+                removed = self.ignore_store.prune_expired()
+
+                if removed > 0:
+                    logger.info(
+                        "Cleanup worker removed %s expired ignored users",
+                        removed,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Cleanup worker failed")
 
     async def polling_loop(self) -> None:
         marker: Optional[int] = None
@@ -405,7 +738,17 @@ async def main() -> None:
     staff_chat_id_env = os.environ.get("STAFF_CHAT_ID_MAX")
     if not staff_chat_id_env:
         raise RuntimeError("STAFF_CHAT_ID_MAX environment variable not set")
-    staff_chat_ids = parse_chat_ids(staff_chat_id_env, "STAFF_CHAT_ID_MAX")
+    staff_chat_ids = parse_int_list(staff_chat_id_env, "STAFF_CHAT_ID_MAX")
+
+    staff_user_id_env = os.environ.get("STAFF_USER_ID_MAX")
+    if not staff_user_id_env:
+        raise RuntimeError("STAFF_USER_ID_MAX environment variable not set")
+    staff_user_ids = parse_int_list(staff_user_id_env, "STAFF_USER_ID_MAX")
+
+    ignore_ttl_seconds = int(os.environ.get("IGNORE_TTL_SECONDS", "1800"))
+    ignore_state_file = os.environ.get("IGNORE_STATE_FILE_MAX", "ignored_users_max.json")
+    bot_state_file = os.environ.get("BOT_STATE_FILE_MAX", "bot_state_max.json")
+    cleanup_interval_seconds = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "300"))
 
     intents = load_intents(scenarios_file)
     fallback_intent = intents.get("fallback")
@@ -426,18 +769,29 @@ async def main() -> None:
             intents=intents,
             fallback_intent=fallback_intent,
             staff_chat_ids=staff_chat_ids,
+            staff_user_ids=staff_user_ids,
             bot_user_id=bot_user_id,
+            ignore_ttl_seconds=ignore_ttl_seconds,
+            ignore_state_file=ignore_state_file,
+            bot_state_file=bot_state_file,
+            cleanup_interval_seconds=cleanup_interval_seconds,
         )
 
         worker_task = asyncio.create_task(bot.escalation_worker())
         polling_task = asyncio.create_task(bot.polling_loop())
+        cleanup_task = asyncio.create_task(bot.cleanup_worker())
 
         try:
-            await asyncio.gather(worker_task, polling_task)
+            await asyncio.gather(worker_task, polling_task, cleanup_task)
         finally:
-            for task in (worker_task, polling_task):
+            for task in (worker_task, polling_task, cleanup_task):
                 task.cancel()
-            await asyncio.gather(worker_task, polling_task, return_exceptions=True)
+            await asyncio.gather(
+                worker_task,
+                polling_task,
+                cleanup_task,
+                return_exceptions=True,
+            )
 
 
 if __name__ == "__main__":
