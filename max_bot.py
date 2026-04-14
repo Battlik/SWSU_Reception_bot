@@ -11,13 +11,14 @@ import aiohttp
 import yaml
 from dotenv import load_dotenv
 
+load_dotenv()
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 logger = logging.getLogger(__name__)
-
-load_dotenv()
 
 
 def normalize_text(text: str) -> str:
@@ -34,6 +35,7 @@ def parse_int_list(value: str, env_name: str) -> List[int]:
         raw = raw.strip()
         if not raw:
             continue
+
         try:
             result.append(int(raw))
         except ValueError as e:
@@ -50,7 +52,7 @@ def parse_int_list(value: str, env_name: str) -> List[int]:
 def escape_markdown(text: str) -> str:
     if not text:
         return ""
-    return re.sub(r'([\\`*_\[\]()~>#+\-=|{}.!])', r'\\\1', text)
+    return re.sub(r'([\\`*_$begin:math:display$$end:math:display$()~>#+\-=|{}.!])', r'\\\1', text)
 
 
 def build_max_user_deeplink(user_id: int) -> Optional[str]:
@@ -161,11 +163,6 @@ class JsonStateFile:
 
 
 class IgnoreStore:
-    """
-    Хранит user_id -> unix_timestamp_until
-    и сохраняет состояние в JSON-файл.
-    """
-
     def __init__(self, path: str) -> None:
         self.path = Path(path)
         self._data: Dict[str, float] = {}
@@ -275,12 +272,9 @@ class BotControlState:
         data = self.storage.load()
         self.paused = bool(data.get("paused", False))
 
-    def save(self) -> None:
-        self.storage.save({"paused": self.paused})
-
     def set_paused(self, value: bool) -> None:
         self.paused = bool(value)
-        self.save()
+        self.storage.save({"paused": self.paused})
 
 
 class MaxBotAPI:
@@ -365,8 +359,7 @@ class AdmissionsBot:
         api: MaxBotAPI,
         intents: Dict[str, Intent],
         fallback_intent: Intent,
-        staff_chat_ids: List[int],
-        staff_user_ids: List[int],
+        staff_ids: List[int],
         bot_user_id: Optional[int],
         ignore_ttl_seconds: int,
         ignore_state_file: str,
@@ -377,11 +370,10 @@ class AdmissionsBot:
         self.intents = intents
         self.fallback_intent = fallback_intent
 
-        self.staff_chat_ids = staff_chat_ids
-        self.staff_chat_ids_set: Set[int] = set(staff_chat_ids)
-
-        self.staff_user_ids = staff_user_ids
-        self.staff_user_ids_set: Set[int] = set(staff_user_ids)
+        # STAFF_CHAT_ID_MAX используем и как список сотрудников,
+        # и как список получателей уведомлений в ЛС
+        self.staff_ids = staff_ids
+        self.staff_ids_set: Set[int] = set(staff_ids)
 
         self.bot_user_id = bot_user_id
 
@@ -393,11 +385,8 @@ class AdmissionsBot:
 
         self.escalation_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
 
-    def is_staff_chat(self, chat_id: Optional[int]) -> bool:
-        return chat_id in self.staff_chat_ids_set if chat_id is not None else False
-
-    def is_staff_user(self, user_id: Optional[int]) -> bool:
-        return user_id in self.staff_user_ids_set if user_id is not None else False
+    def is_staff(self, user_id: Optional[int]) -> bool:
+        return user_id in self.staff_ids_set if user_id is not None else False
 
     def is_paused(self) -> bool:
         return self.control_state.paused
@@ -425,7 +414,7 @@ class AdmissionsBot:
         chat_id: int,
         user_id: int,
     ) -> bool:
-        if not self.is_staff_user(user_id):
+        if not self.is_staff(user_id):
             return False
 
         if text_normalized == "/pause":
@@ -519,13 +508,11 @@ class AdmissionsBot:
             logger.info("Ignoring self message from bot_user_id=%s", user_id)
             return
 
-        # Админские команды сотрудника обрабатываем ДО общего игнора staff
         if await self.handle_admin_command(text_normalized, chat_id, user_id):
             return
 
-        # Обычный /start для пользователей
         if text_normalized == "/start":
-            if self.is_staff_user(user_id):
+            if self.is_staff(user_id):
                 await self.api.send_message(
                     "Для управления ботом используйте:\n"
                     "/pause — поставить бота на паузу\n"
@@ -537,8 +524,8 @@ class AdmissionsBot:
                 await self.send_user_start(chat_id)
             return
 
-        # Полный игнор сотрудников на обычные сообщения
-        if self.is_staff_user(user_id):
+        # Сотрудников игнорируем как обычных пользователей
+        if self.is_staff(user_id):
             logger.info(
                 "Ignoring regular message from staff user_id=%s in chat_id=%s",
                 user_id,
@@ -546,12 +533,6 @@ class AdmissionsBot:
             )
             return
 
-        # Игнор служебных чатов
-        if self.is_staff_chat(chat_id):
-            logger.info("Ignoring message from staff chat_id=%s", chat_id)
-            return
-
-        # Пауза бота
         if self.is_paused():
             logger.info(
                 "Ignoring message because bot is paused: user_id=%s chat_id=%s",
@@ -560,7 +541,6 @@ class AdmissionsBot:
             )
             return
 
-        # Cooldown пользователя
         if self.ignore_store.is_ignored(user_id):
             logger.info(
                 "Ignoring message from user_id=%s due to active cooldown (%s sec left)",
@@ -632,6 +612,7 @@ class AdmissionsBot:
         logger.info("Escalation worker started")
         while True:
             item = await self.escalation_queue.get()
+
             try:
                 user_id = item["user_id"]
                 user_name = item["user_name"]
@@ -656,23 +637,25 @@ class AdmissionsBot:
                     f"Сообщение: {escape_markdown(text)}"
                 )
 
-                for staff_chat_id in self.staff_chat_ids:
+                for staff_id in self.staff_ids:
                     try:
+                        # STAFF_CHAT_ID_MAX трактуем как user_id сотрудника
                         await self.api.send_message(
                             staff_notification,
-                            chat_id=staff_chat_id,
+                            user_id=staff_id,
                             format="markdown",
                         )
                         logger.info(
-                            "Escalation sent to staff chat_id=%s for user_id=%s",
-                            staff_chat_id,
+                            "Escalation sent to staff_id=%s for user_id=%s",
+                            staff_id,
                             user_id,
                         )
                     except Exception:
                         logger.exception(
-                            "Ошибка отправки сотруднику chat_id=%s",
-                            staff_chat_id,
+                            "Ошибка отправки сотруднику staff_id=%s",
+                            staff_id,
                         )
+
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -727,33 +710,27 @@ class AdmissionsBot:
 
 
 async def main() -> None:
-    token = os.environ.get("MAX_BOT_TOKEN")
+    token = os.getenv("MAX_BOT_TOKEN")
     if not token:
         raise RuntimeError("MAX_BOT_TOKEN environment variable not set")
 
-    scenarios_file = os.environ.get("SCENARIOS_FILE", "scen_v5.yaml")
+    staff_id_env = os.getenv("STAFF_CHAT_ID_MAX")
+    if not staff_id_env:
+        raise RuntimeError("STAFF_CHAT_ID_MAX environment variable not set")
+
+    scenarios_file = os.getenv("SCENARIOS_FILE", "scen_v5.yaml")
     if not Path(scenarios_file).exists():
         raise RuntimeError(f"Scenarios file not found: {scenarios_file}")
 
-    staff_chat_id_env = os.environ.get("STAFF_CHAT_ID_MAX")
-    if not staff_chat_id_env:
-        raise RuntimeError("STAFF_CHAT_ID_MAX environment variable not set")
-    staff_chat_ids = parse_int_list(staff_chat_id_env, "STAFF_CHAT_ID_MAX")
+    ignore_ttl_seconds = int(os.getenv("IGNORE_TTL_SECONDS", "1800"))
+    ignore_state_file = os.getenv("IGNORE_STATE_FILE_MAX", "ignored_users_max.json")
+    bot_state_file = os.getenv("BOT_STATE_FILE_MAX", "bot_state_max.json")
+    cleanup_interval_seconds = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "300"))
 
-    staff_user_id_env = os.environ.get("STAFF_USER_ID_MAX")
-    if not staff_user_id_env:
-        raise RuntimeError("STAFF_USER_ID_MAX environment variable not set")
-    staff_user_ids = parse_int_list(staff_user_id_env, "STAFF_USER_ID_MAX")
-
-    ignore_ttl_seconds = int(os.environ.get("IGNORE_TTL_SECONDS", "1800"))
-    ignore_state_file = os.environ.get("IGNORE_STATE_FILE_MAX", "ignored_users_max.json")
-    bot_state_file = os.environ.get("BOT_STATE_FILE_MAX", "bot_state_max.json")
-    cleanup_interval_seconds = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "300"))
+    staff_ids = parse_int_list(staff_id_env, "STAFF_CHAT_ID_MAX")
 
     intents = load_intents(scenarios_file)
-    fallback_intent = intents.get("fallback")
-    if not fallback_intent:
-        raise RuntimeError("No fallback intent found in scenarios file")
+    fallback_intent = intents["fallback"]
 
     async with MaxBotAPI(token) as api:
         me = await api.get_me()
@@ -768,8 +745,7 @@ async def main() -> None:
             api=api,
             intents=intents,
             fallback_intent=fallback_intent,
-            staff_chat_ids=staff_chat_ids,
-            staff_user_ids=staff_user_ids,
+            staff_ids=staff_ids,
             bot_user_id=bot_user_id,
             ignore_ttl_seconds=ignore_ttl_seconds,
             ignore_state_file=ignore_state_file,

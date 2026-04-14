@@ -149,11 +149,6 @@ class JsonStateFile:
 
 
 class IgnoreStore:
-    """
-    Хранит user_id -> unix_timestamp_until
-    и сохраняет состояние в JSON-файл.
-    """
-
     def __init__(self, path: str) -> None:
         self.path = Path(path)
         self._data: Dict[str, float] = {}
@@ -201,7 +196,7 @@ class IgnoreStore:
         )
         tmp_path.replace(self.path)
 
-    def _remove_if_expired(self, user_id: int) -> bool:
+    def is_ignored(self, user_id: int) -> bool:
         key = str(user_id)
         until_ts = self._data.get(key)
         if until_ts is None:
@@ -213,9 +208,6 @@ class IgnoreStore:
             return False
 
         return True
-
-    def is_ignored(self, user_id: int) -> bool:
-        return self._remove_if_expired(user_id)
 
     def remaining_seconds(self, user_id: int) -> int:
         key = str(user_id)
@@ -266,12 +258,9 @@ class BotControlState:
         data = self.storage.load()
         self.paused = bool(data.get("paused", False))
 
-    def save(self) -> None:
-        self.storage.save({"paused": self.paused})
-
     def set_paused(self, value: bool) -> None:
         self.paused = bool(value)
-        self.save()
+        self.storage.save({"paused": self.paused})
 
 
 class AdmissionsBot:
@@ -279,8 +268,7 @@ class AdmissionsBot:
         self,
         intents: Dict[str, Intent],
         fallback_intent: Intent,
-        staff_chat_ids: List[int],
-        staff_user_ids: List[int],
+        staff_ids: List[int],
         ignore_ttl_seconds: int,
         ignore_state_file: str,
         bot_state_file: str,
@@ -289,25 +277,20 @@ class AdmissionsBot:
         self.intents = intents
         self.fallback_intent = fallback_intent
 
-        self.staff_chat_ids = staff_chat_ids
-        self.staff_chat_ids_set: Set[int] = set(staff_chat_ids)
-
-        self.staff_user_ids = staff_user_ids
-        self.staff_user_ids_set: Set[int] = set(staff_user_ids)
+        # STAFF_CHAT_ID используем и как список сотрудников,
+        # и как список получателей уведомлений в ЛС
+        self.staff_ids = staff_ids
+        self.staff_ids_set: Set[int] = set(staff_ids)
 
         self.ignore_ttl_seconds = int(ignore_ttl_seconds)
         self.cleanup_interval_seconds = max(60, int(cleanup_interval_seconds))
 
         self.ignore_store = IgnoreStore(ignore_state_file)
         self.control_state = BotControlState(bot_state_file)
-
         self.escalation_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
 
-    def is_staff_chat(self, chat_id: int) -> bool:
-        return chat_id in self.staff_chat_ids_set
-
-    def is_staff_user(self, user_id: int) -> bool:
-        return user_id in self.staff_user_ids_set
+    def is_staff(self, user_id: int) -> bool:
+        return user_id in self.staff_ids_set
 
     def is_paused(self) -> bool:
         return self.control_state.paused
@@ -322,7 +305,7 @@ class AdmissionsBot:
         user = update.effective_user
         chat = update.effective_chat
 
-        if not self.is_staff_user(user.id):
+        if not self.is_staff(user.id):
             return False
 
         if chat is None or chat.type != "private":
@@ -342,21 +325,16 @@ class AdmissionsBot:
             return
 
         user = update.effective_user
-        chat = update.effective_chat
-
         if user is None:
             return
 
-        if self.is_staff_user(user.id):
+        if self.is_staff(user.id):
             await update.message.reply_text(
                 "Для управления ботом используйте:\n"
                 "/pause — поставить бота на паузу\n"
                 "/resume — снять паузу\n"
                 "/status — проверить статус"
             )
-            return
-
-        if chat and self.is_staff_chat(chat.id):
             return
 
         if self.is_paused():
@@ -426,7 +404,6 @@ class AdmissionsBot:
             return
 
         status_text = "на паузе" if self.is_paused() else "активен"
-
         await update.message.reply_text(
             f"Статус бота: {status_text}\n"
             f"Пользователей в игноре: {self.ignore_store.count()}\n"
@@ -452,7 +429,8 @@ class AdmissionsBot:
         if user.is_bot:
             return
 
-        if self.is_staff_user(user.id):
+        # Сотрудников игнорируем как обычных пользователей
+        if self.is_staff(user.id):
             logger.info(
                 "Ignoring regular message from staff user_id=%s in chat_id=%s",
                 user.id,
@@ -466,10 +444,6 @@ class AdmissionsBot:
                 user.id,
                 chat.id,
             )
-            return
-
-        if self.is_staff_chat(chat.id):
-            logger.info("Ignoring message from staff chat_id=%s", chat.id)
             return
 
         if self.ignore_store.is_ignored(user.id):
@@ -505,13 +479,9 @@ class AdmissionsBot:
             await message.reply_text(matched_intent.response)
             return
 
-        await self.handle_complex_question(update, context)
+        await self.handle_complex_question(update)
 
-    async def handle_complex_question(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
+    async def handle_complex_question(self, update: Update) -> None:
         if update.message is None or update.effective_user is None:
             return
 
@@ -541,7 +511,6 @@ class AdmissionsBot:
                 "chat_title": getattr(chat, "title", None) or str(chat.id),
                 "chat_type": chat.type,
                 "text": message.text,
-                "message_id": message.message_id,
             }
         )
 
@@ -557,7 +526,6 @@ class AdmissionsBot:
 
         while True:
             item = await self.escalation_queue.get()
-
             try:
                 user_id = item["user_id"]
                 user_name = item["user_name"]
@@ -568,7 +536,6 @@ class AdmissionsBot:
                 text = item["text"]
 
                 user_mention = mention_html(user_id, user_name)
-
                 tg_deeplink = build_telegram_user_deeplink(user_id)
                 public_link = build_public_user_link(username)
 
@@ -586,15 +553,14 @@ class AdmissionsBot:
                         f"{escape(public_link)}</a>"
                     )
                 else:
-                    public_link_line = (
-                        "Публичная ссылка: недоступна "
-                        "(у пользователя нет username)"
-                    )
+                    public_link_line = "Публичная ссылка: недоступна"
 
                 if chat_type == "private":
                     chat_line = f"Чат: private (<code>{chat_id}</code>)"
                 else:
-                    chat_line = f"Чат: {escape(str(chat_title))} (<code>{chat_id}</code>)"
+                    chat_line = (
+                        f"Чат: {escape(str(chat_title))} (<code>{chat_id}</code>)"
+                    )
 
                 staff_notification = (
                     f"⚠️ <b>Сложный вопрос</b>\n"
@@ -606,25 +572,29 @@ class AdmissionsBot:
                     f"Сообщение: {escape(text)}"
                 )
 
-                for staff_chat_id in self.staff_chat_ids:
+                for staff_id in self.staff_ids:
                     try:
+                        # STAFF_CHAT_ID трактуем как user_id сотрудника,
+                        # а Telegram позволяет отправлять ЛС по user_id как chat_id
                         await application.bot.send_message(
-                            chat_id=staff_chat_id,
+                            chat_id=staff_id,
                             text=staff_notification,
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True,
                         )
                         logger.info(
-                            "Escalation sent to staff_chat_id=%s for user_id=%s",
-                            staff_chat_id,
+                            "Escalation sent to staff_id=%s for user_id=%s",
+                            staff_id,
                             user_id,
                         )
                     except Exception:
                         logger.exception(
-                            "Failed to send escalation to staff_chat_id=%s",
-                            staff_chat_id,
+                            "Failed to send escalation to staff_id=%s",
+                            staff_id,
                         )
 
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("Error while processing escalation item")
             finally:
@@ -665,22 +635,17 @@ async def main() -> None:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable not set")
 
-    staff_chat_id_env = os.getenv("STAFF_CHAT_ID")
-    if not staff_chat_id_env:
+    staff_id_env = os.getenv("STAFF_CHAT_ID")
+    if not staff_id_env:
         raise RuntimeError("STAFF_CHAT_ID environment variable not set")
 
-    staff_user_id_env = os.getenv("STAFF_USER_ID")
-    if not staff_user_id_env:
-        raise RuntimeError("STAFF_USER_ID environment variable not set")
-
-    scenarios_file = os.getenv("SCENARIOS_FILE", "scenarios.yaml")
+    scenarios_file = os.getenv("SCENARIOS_FILE", "scen_v5.yaml")
     ignore_ttl_seconds = int(os.getenv("IGNORE_TTL_SECONDS", "1800"))
     ignore_state_file = os.getenv("IGNORE_STATE_FILE", "ignored_users.json")
     bot_state_file = os.getenv("BOT_STATE_FILE", "bot_state.json")
     cleanup_interval_seconds = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "300"))
 
-    staff_chat_ids = parse_int_list(staff_chat_id_env, "STAFF_CHAT_ID")
-    staff_user_ids = parse_int_list(staff_user_id_env, "STAFF_USER_ID")
+    staff_ids = parse_int_list(staff_id_env, "STAFF_CHAT_ID")
 
     intents = load_intents(scenarios_file)
     fallback_intent = intents["fallback"]
@@ -688,8 +653,7 @@ async def main() -> None:
     admissions_bot = AdmissionsBot(
         intents=intents,
         fallback_intent=fallback_intent,
-        staff_chat_ids=staff_chat_ids,
-        staff_user_ids=staff_user_ids,
+        staff_ids=staff_ids,
         ignore_ttl_seconds=ignore_ttl_seconds,
         ignore_state_file=ignore_state_file,
         bot_state_file=bot_state_file,
@@ -697,7 +661,6 @@ async def main() -> None:
     )
 
     application = ApplicationBuilder().token(token).build()
-
     command_filter = ~filters.UpdateType.EDITED_MESSAGE
 
     application.add_handler(
@@ -712,14 +675,12 @@ async def main() -> None:
     application.add_handler(
         CommandHandler("status", admissions_bot.cmd_status, filters=command_filter)
     )
-
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, admissions_bot.handle_message)
     )
-
     application.add_error_handler(on_error)
 
-    logger.info("Starting bot...")
+    logger.info("Starting Telegram bot...")
 
     escalation_task: Optional[asyncio.Task[Any]] = None
     cleanup_task: Optional[asyncio.Task[Any]] = None
@@ -730,13 +691,12 @@ async def main() -> None:
     escalation_task = asyncio.create_task(admissions_bot.escalation_worker(application))
     cleanup_task = asyncio.create_task(admissions_bot.cleanup_worker())
 
-    logger.info("Background workers started")
     await application.updater.start_polling()
 
     try:
         await asyncio.Event().wait()
     finally:
-        logger.info("Stopping bot...")
+        logger.info("Stopping Telegram bot...")
 
         await application.updater.stop()
 
