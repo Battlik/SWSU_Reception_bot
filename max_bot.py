@@ -385,8 +385,8 @@ class AdmissionsBot:
 
         self.escalation_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
 
-    def is_staff(self, user_id: Optional[int]) -> bool:
-        return user_id in self.staff_ids_set if user_id is not None else False
+    def is_staff_chat(self, chat_id: Optional[int]) -> bool:
+        return chat_id in self.staff_ids_set if chat_id is not None else False
 
     def is_paused(self) -> bool:
         return self.control_state.paused
@@ -414,7 +414,7 @@ class AdmissionsBot:
         chat_id: int,
         user_id: int,
     ) -> bool:
-        if not self.is_staff(user_id):
+        if not self.is_staff_chat(chat_id):
             return False
 
         if text_normalized == "/pause":
@@ -642,7 +642,7 @@ class AdmissionsBot:
                         # STAFF_CHAT_ID_MAX трактуем как user_id сотрудника
                         await self.api.send_message(
                             staff_notification,
-                            user_id=staff_id,
+                            chat_id=staff_id,
                             format="markdown",
                         )
                         logger.info(
